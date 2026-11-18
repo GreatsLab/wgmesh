@@ -1,0 +1,174 @@
+"""Keys and wg-quick config rendering."""
+from __future__ import annotations
+
+import base64
+import ipaddress
+import json
+import os
+import secrets
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+from .model import Inventory, Link, plan
+
+
+def genkey() -> tuple:
+    """Same as `wg genkey | tee priv | wg pubkey`."""
+    k = X25519PrivateKey.generate()
+    priv = k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                           serialization.NoEncryption())
+    pub = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.b64encode(priv).decode(), base64.b64encode(pub).decode()
+
+
+def pubkey(priv_b64: str) -> str:
+    k = X25519PrivateKey.from_private_bytes(base64.b64decode(priv_b64))
+    raw = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.b64encode(raw).decode()
+
+
+class KeyStore:
+    """Keys live in a separate JSON file so the inventory can go in git and
+    the keys don't. Re-running keeps existing keys - regenerating every
+    time would mean redeploying every node for any small change."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.data = {"nodes": {}, "psk": {}}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                self.data = json.load(fh)
+        self.dirty = False
+
+    def node(self, name: str) -> dict:
+        if name not in self.data["nodes"]:
+            priv, pub = genkey()
+            self.data["nodes"][name] = {"private": priv, "public": pub}
+            self.dirty = True
+        return self.data["nodes"][name]
+
+    def rotate(self, name: str):
+        self.data["nodes"].pop(name, None)
+        for k in list(self.data["psk"]):
+            if name in k.split("|"):
+                del self.data["psk"][k]
+        self.node(name)
+
+    def psk(self, a: str, b: str) -> str:
+        k = "|".join(sorted((a, b)))
+        if k not in self.data["psk"]:
+            self.data["psk"][k] = base64.b64encode(secrets.token_bytes(32)).decode()
+            self.dirty = True
+        return self.data["psk"][k]
+
+    def prune(self, names):
+        names = set(names)
+        for n in list(self.data["nodes"]):
+            if n not in names:
+                del self.data["nodes"][n]
+                self.dirty = True
+        for k in list(self.data["psk"]):
+            if not set(k.split("|")) <= names:
+                del self.data["psk"][k]
+                self.dirty = True
+
+    def save(self):
+        if not self.dirty:
+            return
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
+        self.dirty = False
+
+
+def _collapse(nets):
+    return [str(n) for n in ipaddress.collapse_addresses(nets)]
+
+
+def peers_for(inv: Inventory, links: list, me: str) -> dict:
+    """{peer_name: [allowed prefixes]} for node `me`."""
+    out: dict[str, list] = {}
+
+    if inv.topology == "hub":
+        hubs = inv.hubs
+        if me in hubs:
+            for l in links:
+                if me in (l.a, l.b):
+                    other = l.b if l.a == me else l.a
+                    out[other] = inv.get(other).allowed()
+            return out
+        # spoke: first hub carries the whole tunnel network + every other
+        # node's routes; extra hubs only get their own address. WireGuard
+        # won't let the same prefix sit on two peers of one interface.
+        primary, *others = hubs
+        rest = [inv.network]
+        for n in inv.nodes:
+            if n.name != me:
+                rest += n.routes
+        out[primary] = rest
+        for h in others:
+            out[h] = inv.get(h).allowed()
+        return out
+
+    for l in links:
+        if me not in (l.a, l.b) or l.kind != "direct":
+            continue
+        other = l.b if l.a == me else l.a
+        out.setdefault(other, []).extend(inv.get(other).allowed())
+    # relayed: the far node's prefixes go on the relay's peer entry
+    for l in links:
+        if l.kind == "relayed" and me in (l.a, l.b):
+            far = l.b if l.a == me else l.a
+            out.setdefault(l.via, []).extend(inv.get(far).allowed())
+    return out
+
+
+def forwards(inv: Inventory, links: list, name: str) -> bool:
+    if inv.topology == "hub" and name in inv.hubs:
+        return True
+    if any(l.kind == "relayed" and l.via == name for l in links):
+        return True
+    return bool(inv.get(name).routes)
+
+
+def render_node(inv: Inventory, keys: KeyStore, name: str, links=None) -> str:
+    links = links if links is not None else plan(inv)
+    me = inv.get(name)
+    k = keys.node(name)
+    lines = [
+        f"# {name} - generated by wgmesh, don't edit by hand, change the inventory instead",
+        "[Interface]",
+        f"Address = {me.address}",
+        f"PrivateKey = {k['private']}",
+    ]
+    if me.listen_port:
+        lines.append(f"ListenPort = {me.listen_port}")
+    if me.dns:
+        lines.append(f"DNS = {', '.join(me.dns)}")
+    if me.mtu:
+        lines.append(f"MTU = {me.mtu}")
+    if forwards(inv, links, name):
+        lines += [
+            "# this node forwards traffic for others",
+            "PostUp = sysctl -qw net.ipv4.ip_forward=1",
+            "PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT",
+            "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT",
+        ]
+
+    peers = peers_for(inv, links, name)
+    for pname in sorted(peers, key=lambda n: [x.name for x in inv.nodes].index(n)):
+        p = inv.get(pname)
+        lines += ["", f"[Peer]", f"# {pname}"]
+        lines.append(f"PublicKey = {keys.node(pname)['public']}")
+        if inv.preshared:
+            lines.append(f"PresharedKey = {keys.psk(name, pname)}")
+        if p.endpoint:
+            lines.append(f"Endpoint = {p.endpoint}")
+        lines.append(f"AllowedIPs = {', '.join(_collapse(peers[pname]))}")
+        # we're behind NAT and they're the one we dial: keep the mapping alive
+        if not me.public and p.public and inv.keepalive:
+            lines.append(f"PersistentKeepalive = {inv.keepalive}")
+    return "\n".join(lines) + "\n"

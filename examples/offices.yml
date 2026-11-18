@@ -1,0 +1,24 @@
+# Three offices + two cloud VPSes + a laptop.
+# Lagos and Abuja offices sit behind ISP NAT (no public IP), so they can't
+# reach each other directly - wgmesh routes them through a VPS.
+network: 10.77.0.0/24
+topology: mesh
+port: 51820
+keepalive: 25
+
+nodes:
+  vps-lagos:
+    endpoint: vps1.example.net        # port defaults to 51820
+  vps-frankfurt:
+    endpoint: 203.0.113.40:51821
+    listen_port: 51821
+  office-lagos:
+    routes: [192.168.10.0/24]         # office LAN reachable through this node
+  office-abuja:
+    routes: [192.168.20.0/24]
+  office-ph:
+    address: 10.77.0.50
+    endpoint: 198.51.100.7            # this one has a static IP
+    routes: [192.168.30.0/24]
+  laptop-great:
+    dns: [10.77.0.1]

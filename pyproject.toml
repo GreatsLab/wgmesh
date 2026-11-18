@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wgmesh"
+version = "0.3.0"
+description = "Generate WireGuard full-mesh or hub-and-spoke configs from one YAML file, including NAT relays"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Chimnadindu Chibueze"}]
+dependencies = ["cryptography>=41", "PyYAML>=6"]
+
+[project.scripts]
+wgmesh = "wgmesh.cli:main"
+
+[tool.setuptools]
+packages = ["wgmesh"]
